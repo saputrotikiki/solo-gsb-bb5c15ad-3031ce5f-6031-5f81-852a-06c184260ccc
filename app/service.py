@@ -70,6 +70,10 @@ class ScheduleInfeasibleError(Exception):
     """禁排约束下无法排出满足最大间隔的校准时点。"""
 
 
+class InsufficientObservationsError(Exception):
+    """当前观测不足两条，无法构造有覆盖范围的插值曲线。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -890,4 +894,57 @@ def plan_calibration_schedule(
         ],
         "suggested": [{"timestamp": p, "timestamp_iso": epoch_to_iso(p)} for p in suggested],
         "segments": segments,
+    }
+
+
+# ---------- 校准曲线精简（只读） ----------
+
+def simplify_calibration_curve(max_error: float) -> dict:
+    """从当前观测中选择全局最少的子序列，使精简折线相对原折线的逐折点偏差
+    均不超过 max_error；首尾观测必须保留，点数并列时取时点序列字典序最早者。
+
+    只读：连接置为 query_only，绝不改写当前观测、修订历史或区间表。可行性与
+    全局最大误差都逐一核对每条弦跨越的每个原观测折点（不做固定步长采样，也不
+    只查弦端点）；每段上两条折线的差是线性函数，段内最大偏差必落在端点（原观测
+    折点），故逐折点核对即覆盖整个连续范围。当前观测不足两条时抛冲突异常。
+    """
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")  # 强制只读，精简不落库
+        rows = conn.execute("SELECT id, ts, bias FROM observations ORDER BY ts").fetchall()
+    if len(rows) < 2:
+        raise InsufficientObservationsError(
+            f"need at least 2 observations to simplify the calibration curve, "
+            f"got {len(rows)}"
+        )
+    points = [(r["ts"], r["bias"]) for r in rows]
+    kept, deviations = calibration.simplify_polyline(points, max_error)
+
+    # 全局实际最大误差及其最早发生时点：严格更大才更新，并列保留最早时点
+    max_abs_error = deviations[0]
+    max_error_idx = 0
+    for idx in range(1, len(deviations)):
+        if deviations[idx] > max_abs_error:
+            max_abs_error = deviations[idx]
+            max_error_idx = idx
+
+    return {
+        "max_error": max_error,
+        "coverage_from": points[0][0],
+        "coverage_from_iso": epoch_to_iso(points[0][0]),
+        "coverage_to": points[-1][0],
+        "coverage_to_iso": epoch_to_iso(points[-1][0]),
+        "original_count": len(rows),
+        "retained_count": len(kept),
+        "retained": [
+            {
+                "observation_id": rows[idx]["id"],
+                "timestamp": rows[idx]["ts"],
+                "timestamp_iso": epoch_to_iso(rows[idx]["ts"]),
+                "bias": rows[idx]["bias"],
+            }
+            for idx in kept
+        ],
+        "max_abs_error": max_abs_error,
+        "max_error_at": rows[max_error_idx]["ts"],
+        "max_error_at_iso": epoch_to_iso(rows[max_error_idx]["ts"]),
     }

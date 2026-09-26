@@ -1,10 +1,14 @@
 """FastAPI 入口：仪器校准漂移补偿 API。"""
 from __future__ import annotations
 
+import math
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from . import receipts
 from . import service
@@ -12,6 +16,8 @@ from .calibration import CalibrationError
 from .db import init_db
 from .receipt_keys import load_key_ring
 from .models import (
+    CalibrationCurveSimplifyIn,
+    CalibrationCurveSimplifyOut,
     CalibrationSchedulePlanIn,
     CalibrationSchedulePlanOut,
     CorrectionIn,
@@ -40,6 +46,7 @@ from .service import (
     DuplicateTimestampError,
     InsufficientAnchorsError,
     InsufficientNeighborsError,
+    InsufficientObservationsError,
     InvalidBudgetError,
     InvalidLimitError,
     InvalidMaxGapError,
@@ -62,13 +69,26 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Instrument Calibration Drift Compensation API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交参考值与同一时点至少 3 次读数，服务标记异常读数并计算校准偏差；"
         "在相邻观测时点间线性插值偏差，对待校正读数施加补偿。"
     ),
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    """422 校验错误处理器：结构与 FastAPI 默认 {"detail": [...]} 完全一致，
+    仅把无法被标准 JSON 序列化的回显输入（NaN/±Infinity 等非有限浮点）替换为
+    字符串占位，避免默认处理器因回显原始 NaN 而序列化成 500。"""
+    detail = exc.errors()
+    for err in detail:
+        value = err.get("input")
+        if isinstance(value, float) and not math.isfinite(value):
+            err["input"] = str(value)
+    return JSONResponse(status_code=422, content=jsonable_encoder({"detail": detail}))
 
 
 @app.get("/health")
@@ -321,3 +341,20 @@ def get_drift_stability_window(
         return service.drift_stability_window(frm=from_, to=to, max_spread=max_spread)
     except (InvalidWindowError, InvalidSpreadError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/calibration-curves/simplify", response_model=CalibrationCurveSimplifyOut)
+def post_calibration_curve_simplify(payload: CalibrationCurveSimplifyIn) -> dict:
+    """精简当前观测构成的分段线性偏差曲线；只读，不写观测、修订历史或区间表。
+
+    当前观测按时点排序后，首尾观测必须保留，仅从原观测中选择子序列，使相邻保留点
+    线性插值得到的曲线在完整覆盖范围内与原曲线的绝对偏差逐原折点核对均不超过
+    max_error（不做固定步长采样、不只查弦端点），并使保留点数全局最少；点数并列时
+    选择时点序列字典序最早者。响应返回保留点的 ID、时点、偏差，以及全局实际最大
+    误差及其最早发生时点。max_error 必须是有限非负数，否则返回 422；当前观测不足
+    两条时返回 409。
+    """
+    try:
+        return service.simplify_calibration_curve(max_error=payload.max_error)
+    except InsufficientObservationsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

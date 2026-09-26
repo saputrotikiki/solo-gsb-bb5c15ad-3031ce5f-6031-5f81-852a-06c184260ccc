@@ -350,3 +350,74 @@ def plan_calibrations(
             return None
         suggested.extend(points)
     return suggested
+
+
+# ---------- 校准曲线精简（保留点全局最少） ----------
+
+def chord_value(t_k: float, t_i: float, b_i: float, t_j: float, b_j: float) -> float:
+    """弦 (t_i, b_i)→(t_j, b_j) 在时点 t_k 处的线性插值。"""
+    return b_i + (b_j - b_i) * (t_k - t_i) / (t_j - t_i)
+
+
+def simplify_polyline(
+    points: list[tuple[float, float]], max_error: float
+) -> tuple[list[int], list[float]]:
+    """从按时点升序的折点 points 中仅选择原折点构成子序列，首尾必须保留，
+    使其弦折线（相邻保留点间线性插值）在完整覆盖范围内对原折线的逐折点绝对
+    偏差均不超过 max_error，并使保留点数全局最少；保留点数并列时选择时点序列
+    字典序最早者（时点严格递增，等价于索引序列字典序最早）。
+
+    可行性核对：弦 i→j 是否可用，要逐一核对它跨越的每个原观测折点
+    k（i < k < j）：|b_k − chord_i→j(t_k)| ≤ max_error——不做固定步长采样，
+    也不只查弦端点（端点偏差恒为 0）。在“可行弦”构成的 DAG 上做边权 1 的
+    最短路即得全局最少保留点；同长度路径并列时保留字典序最早的索引元组。
+
+    返回 (保留点在 points 中的索引列表, 每个原折点相对精简曲线的绝对偏差列表)。
+    原观测点为 0/1 个时原样返回（调用方负责在不足两条时拒绝请求）。
+    """
+    n = len(points)
+    if n <= 1:
+        return list(range(n)), [0.0] * n
+    # feasible[i][j]：弦 i→j 跨越的每个原折点逐一核对后偏差是否都不超过 max_error
+    feasible = [bytearray(n) for _ in range(n)]
+    for i in range(n - 1):
+        t_i, b_i = points[i]
+        for j in range(i + 1, n):
+            t_j, b_j = points[j]
+            dt = t_j - t_i
+            ok = True
+            for k in range(i + 1, j):  # 逐一核对跨越的每个原折点，绝不只查端点
+                t_k, b_k = points[k]
+                chord = b_i + (b_j - b_i) * (t_k - t_i) / dt
+                if abs(b_k - chord) > max_error:
+                    ok = False
+                    break
+            if ok:
+                feasible[i][j] = 1
+    # DAG 最短路：dp[j] = 到达 j 的最少点数；并列保留字典序最早的索引序列
+    inf = n + 1
+    dp = [inf] * n
+    best: list[tuple[int, ...] | None] = [None] * n
+    dp[0] = 1
+    best[0] = (0,)
+    for j in range(1, n):
+        for i in range(j):
+            if not feasible[i][j]:
+                continue
+            cand_len = dp[i] + 1
+            if cand_len > dp[j]:
+                continue
+            cand = best[i] + (j,)  # 邻边恒可行，best[i] 必已到达
+            if cand_len < dp[j] or cand < best[j]:
+                dp[j] = cand_len
+                best[j] = cand
+    kept = list(best[n - 1])
+    # 精简曲线在每个原折点处的绝对偏差：逐保留段对跨越折点重算（保留点处为 0）
+    deviations = [0.0] * n
+    for a, b in zip(kept, kept[1:]):
+        t_a, b_a = points[a]
+        t_b, b_b = points[b]
+        for k in range(a + 1, b):
+            t_k, b_k = points[k]
+            deviations[k] = abs(b_k - chord_value(t_k, t_a, b_a, t_b, b_b))
+    return kept, deviations

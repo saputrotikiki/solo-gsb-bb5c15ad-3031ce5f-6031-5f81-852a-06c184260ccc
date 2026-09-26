@@ -1,10 +1,11 @@
 """Pydantic 请求/响应模型。时间戳对外同时提供 Unix 秒与 ISO 8601 两种形式。"""
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, Field, field_validator
 
 
 def epoch_to_iso(ts: float) -> str:
@@ -75,6 +76,25 @@ class CalibrationSchedulePlanIn(BaseModel):
         default_factory=list,
         description="禁排时段（可选）：先规范化合并，其开区间内部禁止排期，边界允许",
     )
+
+
+class CalibrationCurveSimplifyIn(BaseModel):
+    max_error: float = Field(
+        description="允许的最大绝对偏差（有限且非负）：精简曲线逐原折点的偏差均不得超过该值"
+    )
+
+    @field_validator("max_error", mode="before")
+    @classmethod
+    def _validate_non_negative_finite(cls, value: Any) -> Any:
+        # 只接受 JSON 数值（int/float）；布尔、字符串等冒充类型拒绝（422）。
+        # NaN/±Infinity 也要 422，但它们经 float() 后无法被标准 JSON 响应回显，
+        # 故在 float 转换之前先按原始文本拒绝，避免默认 422 处理器序列化崩溃。
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("max_error must be a number")
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError("max_error must be a finite non-negative number")
+        return value  # max_error = 0 合法（通常要求保留全部折点）
 
 
 # ---------- 响应 ----------
@@ -315,3 +335,28 @@ class CalibrationSchedulePlanOut(BaseModel):
     segments: list[ScheduleSegmentOut] = Field(
         description="固定锚点与建议时点合并排序后的逐段间隔，按时间排序"
     )
+
+
+class SimplifiedPointOut(BaseModel):
+    observation_id: int = Field(description="保留观测的 ID（原样引用，不新建/不改写）")
+    timestamp: float = Field(description="保留观测时点（Unix 秒）")
+    timestamp_iso: str
+    bias: float = Field(description="该保留点的校准偏差（精简曲线经过原观测点，该点偏差恒为 0）")
+
+
+class CalibrationCurveSimplifyOut(BaseModel):
+    max_error: float = Field(description="请求允许的最大绝对偏差（有限非负数）")
+    coverage_from: float = Field(description="精简曲线完整覆盖范围下界 = 最早观测时点（Unix 秒）")
+    coverage_from_iso: str
+    coverage_to: float = Field(description="精简曲线完整覆盖范围上界 = 最晚观测时点（Unix 秒）")
+    coverage_to_iso: str
+    original_count: int = Field(description="原观测条数（按时点排序）")
+    retained_count: int = Field(description="保留点数：全局最少（首尾观测必保留）")
+    retained: list[SimplifiedPointOut] = Field(
+        description="保留点子序列（原观测的子集），按时点排序；同点数方案并列时取时点序列字典序最早者"
+    )
+    max_abs_error: float = Field(
+        description="精简曲线与原曲线的全局实际最大绝对偏差（逐一核对全部原观测折点得到，不采样）"
+    )
+    max_error_at: float = Field(description="全局实际最大误差的最早发生时点（Unix 秒，必为某原观测折点）")
+    max_error_at_iso: str
