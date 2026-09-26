@@ -12,6 +12,8 @@ from .calibration import CalibrationError
 from .db import init_db
 from .receipt_keys import load_key_ring
 from .models import (
+    CalibrationCurveSimplifyIn,
+    CalibrationCurveSimplifyOut,
     CalibrationSchedulePlanIn,
     CalibrationSchedulePlanOut,
     CorrectionIn,
@@ -40,6 +42,7 @@ from .service import (
     DuplicateTimestampError,
     InsufficientAnchorsError,
     InsufficientNeighborsError,
+    InsufficientObservationsError,
     InvalidBudgetError,
     InvalidLimitError,
     InvalidMaxGapError,
@@ -62,7 +65,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Instrument Calibration Drift Compensation API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交参考值与同一时点至少 3 次读数，服务标记异常读数并计算校准偏差；"
         "在相邻观测时点间线性插值偏差，对待校正读数施加补偿。"
@@ -321,3 +324,20 @@ def get_drift_stability_window(
         return service.drift_stability_window(frm=from_, to=to, max_spread=max_spread)
     except (InvalidWindowError, InvalidSpreadError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/calibration-curves/simplify", response_model=CalibrationCurveSimplifyOut)
+def post_calibration_curve_simplify(payload: CalibrationCurveSimplifyIn) -> dict:
+    """在误差上界内精简当前校准曲线；只读，不改写观测、修订历史或区间表。
+
+    以当前全部观测（按时点升序）为原折线，仅从原观测中选出子序列（首尾必保留），
+    使其线性插值曲线在完整覆盖范围内与原曲线的绝对偏差不超过 max_error，且保留
+    点数全局最少；点数并列时取时点序列字典序最早者。误差逐一核对被跨越的每个原
+    观测折点（相邻折点间偏差为线性，峰值必在折点处），不采样、不只查端点。返回
+    保留点的观测 ID、时点与偏差，以及全局实际最大误差及其最早发生时点。
+    max_error 须为有限非负，否则 422；当前观测不足两条返回 409。
+    """
+    try:
+        return service.simplify_calibration_curve(max_error=payload.max_error)
+    except InsufficientObservationsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

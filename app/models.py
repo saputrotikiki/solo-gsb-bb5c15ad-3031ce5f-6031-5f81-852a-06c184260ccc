@@ -77,6 +77,14 @@ class CalibrationSchedulePlanIn(BaseModel):
     )
 
 
+class CalibrationCurveSimplifyIn(BaseModel):
+    max_error: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="允许的最大绝对偏差（有限非负）：精简曲线与原曲线在完整覆盖范围内的偏差不超过该值",
+    )
+
+
 # ---------- 响应 ----------
 
 class ReadingOut(BaseModel):
@@ -315,3 +323,22 @@ class CalibrationSchedulePlanOut(BaseModel):
     segments: list[ScheduleSegmentOut] = Field(
         description="固定锚点与建议时点合并排序后的逐段间隔，按时间排序"
     )
+
+
+class SimplifiedPointOut(BaseModel):
+    observation_id: int = Field(description="保留点对应的观测 ID")
+    timestamp: float = Field(description="保留点时点（Unix 秒）")
+    timestamp_iso: str
+    bias: float = Field(description="该观测的校准偏差")
+
+
+class CalibrationCurveSimplifyOut(BaseModel):
+    max_error: float = Field(description="请求允许的最大绝对偏差（有限非负）")
+    kept: list[SimplifiedPointOut] = Field(
+        description="保留的观测子序列：首尾必含，点数全局最少，并列时时点序列字典序最早，按时间排序"
+    )
+    actual_max_error: float = Field(
+        description="精简曲线与原曲线在完整覆盖范围内的实际最大绝对偏差（不超过 max_error）"
+    )
+    actual_max_error_at: float = Field(description="实际最大误差的最早发生时点（Unix 秒）")
+    actual_max_error_at_iso: str

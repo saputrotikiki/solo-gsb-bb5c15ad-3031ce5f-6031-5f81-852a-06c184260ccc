@@ -7,6 +7,7 @@ import time
 from contextlib import closing
 
 from . import calibration
+from . import simplification
 from .db import connect
 from .models import epoch_to_iso
 
@@ -68,6 +69,10 @@ class InsufficientAnchorsError(Exception):
 
 class ScheduleInfeasibleError(Exception):
     """禁排约束下无法排出满足最大间隔的校准时点。"""
+
+
+class InsufficientObservationsError(Exception):
+    """当前观测不足两条，无法构成可精简的校准曲线。"""
 
 
 # ---------- 观测 ----------
@@ -890,4 +895,40 @@ def plan_calibration_schedule(
         ],
         "suggested": [{"timestamp": p, "timestamp_iso": epoch_to_iso(p)} for p in suggested],
         "segments": segments,
+    }
+
+
+# ---------- 校准曲线精简 ----------
+
+def simplify_calibration_curve(max_error: float) -> dict:
+    """在误差上界内精简当前校准曲线；只读，不写观测、修订历史或区间表。
+
+    取当前全部观测按时点升序作为原折线，交给纯函数 simplification.simplify_curve
+    求保留点数全局最少的子序列（首尾必保留，点数并列时取时点序列字典序最早者）；
+    误差逐一核对被跨越的每个原观测折点，不采样、不只查端点。连接置为 query_only，
+    任何写操作都会被 SQLite 拒绝。当前观测不足两条时抛冲突异常。
+    """
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")  # 强制只读，精简不落库
+        rows = conn.execute("SELECT id, ts, bias FROM observations ORDER BY ts").fetchall()
+    if len(rows) < 2:
+        raise InsufficientObservationsError(
+            f"need at least 2 observations to simplify the calibration curve, got {len(rows)}"
+        )
+    points = [(row["ts"], row["bias"]) for row in rows]
+    kept, max_dev, max_dev_at = simplification.simplify_curve(points, max_error)
+    return {
+        "max_error": max_error,
+        "kept": [
+            {
+                "observation_id": rows[i]["id"],
+                "timestamp": rows[i]["ts"],
+                "timestamp_iso": epoch_to_iso(rows[i]["ts"]),
+                "bias": rows[i]["bias"],
+            }
+            for i in kept
+        ],
+        "actual_max_error": max_dev,
+        "actual_max_error_at": max_dev_at,
+        "actual_max_error_at_iso": epoch_to_iso(max_dev_at),
     }

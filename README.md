@@ -31,6 +31,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 13. **观测影响预演**：`POST /observation-impact-preview` 接收一条**不落库**的候选观测与正数 `impact_limit`，沿用现有异常判定算出候选偏差，预演插入对当前分段线性偏差曲线的影响。仅在候选时点两侧都已有观测时预演（候选时点已占用或无法形成双侧邻点均返回 409）：插入只会把左右最近观测之间的区间重新分段，受影响范围即 `[prev, next]`；曲线变化量 Δ 是折点 `(prev, 0) → (候选, Δc) → (next, 0)` 的分段线性函数，返回受影响时间范围、最大绝对偏差变化及其最早发生时点，以及 `|Δ| > impact_limit` 的连续区间（阈值交点解析求解，恰等于阈值的瞬时不计入，不做固定步长采样）。请求**只读**，不改写观测、修订历史或区间表。
 14. **校正回执与密钥轮换**：`POST /correction-receipts` 复用 `/corrections` 的漂移补偿，并以键环当前活跃键签发 `version=2` 的 HMAC 回执：返回 `version`、`key_id`（签发密钥 ID）、归一化请求（`timestamp` 统一为 Unix 秒）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt`。签名载荷按 `version`、`key_id`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 顺序组成 JSON 数组，数值取 JSON 最短十进制、UTF-8 编码且无任何空白，以 `CORRECTION_RECEIPT_KEYS` 键环中 `key_id` 对应的密钥计算 HMAC-SHA256，输出小写十六进制。`POST /correction-receipts/verify` 接收完整回执，按 `key_id` **精确选键**重算签名并以**常量时间**比较：任一签名字段被改动、或 `key_id` 未知/已轮换出环均返回 `{"valid": false}`（旧键保留在环内时，轮换前签发的回执仍可验证）；结构缺失或类型错误返回 422。历史 `version=1` 回执继续按旧规则校验（密钥取自 `CORRECTION_RECEIPT_SECRET`，载荷不含 `key_id`）。键环在启动时校验：空键环、未知活跃键、非法 `key_id` 一律拒绝启动。
 15. **校准排期规划**：`POST /calibration-schedules/plan` 在 `[from, to]` 窗口内规划**数量最少**的新增校准时点。固定锚点取窗口两侧能覆盖边界的现有观测（`from` 之前最近一次、`to` 之后最近一次，恰落在边界上的观测自然入选）与窗口内全部观测；在禁排时段之外插入最少的新增时点，使所有相邻锚点（含新增时点）的间隔都不超过 `max_gap`。禁排时段先**规范化合并**（丢弃空区间、排序、合并重叠或端点相接的区间），合并后区间的**开区间内部**禁止排期、**边界允许排期**；多个最少方案并列时返回**字典序最早**的一组。响应含规范化后的禁排时段、固定锚点、建议时点与逐段间隔。请求**只读**，不改写观测、修订历史或区间表；缺少覆盖边界的现有锚点或约束无解返回 409，`from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` 返回 400。
+16. **校准曲线精简**：`POST /calibration-curves/simplify` 接收有限非负 `max_error`，以当前全部观测（按时点升序）为原折线，仅从原观测中选出子序列（**首尾必保留**），使其线性插值曲线在完整覆盖范围内与原曲线的绝对偏差不超过 `max_error`，且**保留点数全局最少**；点数并列时取**时点序列字典序最早**者。误差**逐一核对被跨越的每个原观测折点**（相邻折点间偏差为线性，峰值必在折点处），不采样、不只查端点。返回保留点的观测 ID、时点与偏差，以及全局实际最大误差及其最早发生时点。请求**只读**，不改写观测、修订历史或区间表；`max_error` 非有限非负（负数、NaN、±Inf、缺字段、非数值）返回 422，当前观测不足两条返回 409。
 
 ## API 一览
 
@@ -51,6 +52,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 | GET | `/drift-budget-depletion` | 解析求解漂移预算（\|bias\|·秒）首次耗尽的精确时点 |
 | GET | `/drift-stability-window` | 解析求解 max(bias) − min(bias) ≤ max_spread 的最长连续稳定子区间 |
 | POST | `/calibration-schedules/plan` | 规划窗口内数量最少的新增校准时点（禁排之外、相邻间隔 ≤ max_gap、字典序最早；只读） |
+| POST | `/calibration-curves/simplify` | 在误差上界内精简校准曲线：保留点数全局最少的原观测子序列（首尾必含、字典序最早；只读） |
 | GET | `/health` | 健康检查 |
 
 时间戳支持 Unix 秒（数字）或 ISO 8601 字符串（如 `2026-09-18T08:00:00Z`），缺省为服务器当前时间。
@@ -479,14 +481,53 @@ curl -X POST http://localhost:8000/calibration-schedules/plan \
 
 无禁排时本例只需 1 个时点（10:00），但它落在禁排开区间 (09:30, 10:30) 内，故最少方案为 2 个时点（08:30 与禁排边界 10:30）。缺少覆盖边界的现有锚点（`from` 之前或 `to` 之后无任何观测）或约束无解（禁排封死所有可行位置，例如禁排段比 `max_gap` 还宽）返回 **409**；`from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` 返回 **400**。
 
+### 校准曲线精简
+
+`POST /calibration-curves/simplify` 回答“在误差上界内，最少需要保留哪些观测就能重建出足够接近的校准曲线”，请求**只读**，不改写观测、修订历史或区间表。请求体仅含 `max_error`（有限非负）：以当前全部观测（按时点升序）为原折线，仅从原观测中选出子序列（**首尾必保留**），使精简后的线性插值曲线在完整覆盖范围内与原曲线的绝对偏差不超过 `max_error`，且**保留点数全局最少**；点数并列时取**时点序列字典序最早**者。误差判定**逐一核对被跨越的每个原观测折点**——相邻折点间两条折线之差是线性函数，峰值必在折点处，因此无需采样也不会只查端点。
+
+先登记 5 条整点观测（均 `reference=100.0`、`tolerance=0.5`，三次读数相同使 `bias` 依次为 `1.0 / 1.75 / 2.0 / 1.5 / 2.0`）：
+
+```bash
+curl -X POST http://localhost:8000/observations \
+  -H 'Content-Type: application/json' \
+  -d '{"timestamp": "2026-09-18T08:00:00Z", "reference": 100.0,
+       "tolerance": 0.5, "readings": [99.0, 99.0, 99.0]}'
+# …再登记 09:00/10:00/11:00/12:00 四条，readings 分别为 [98.25,…]、[98.0,…]、[98.5,…]、[98.0,…]
+```
+
+```bash
+curl -X POST http://localhost:8000/calibration-curves/simplify \
+  -H 'Content-Type: application/json' \
+  -d '{"max_error": 0.4}'
+```
+
+响应（首尾直连在 09:00/10:00 的偏差为 0.5，超出 0.4；最少保留 4 点，10:00 的观测被舍弃）：
+
+```json
+{
+  "max_error": 0.4,
+  "kept": [
+    {"observation_id": 1, "timestamp": 1789718400.0, "timestamp_iso": "2026-09-18T08:00:00+00:00", "bias": 1.0},
+    {"observation_id": 2, "timestamp": 1789722000.0, "timestamp_iso": "2026-09-18T09:00:00+00:00", "bias": 1.75},
+    {"observation_id": 4, "timestamp": 1789729200.0, "timestamp_iso": "2026-09-18T11:00:00+00:00", "bias": 1.5},
+    {"observation_id": 5, "timestamp": 1789732800.0, "timestamp_iso": "2026-09-18T12:00:00+00:00", "bias": 2.0}
+  ],
+  "actual_max_error": 0.375,
+  "actual_max_error_at": 1789725600.0,
+  "actual_max_error_at_iso": "2026-09-18T10:00:00+00:00"
+}
+```
+
+`actual_max_error` 是精简曲线与原曲线在完整覆盖范围内的**实际**最大绝对偏差（不超过 `max_error`），`actual_max_error_at` 为其最早发生时点；上例即保留段 09:00→11:00 的插值 `1.625` 与被舍弃观测 10:00 的偏差 `2.0` 之差。若本例改用 `max_error ≥ 0.5`，则只保留首尾两条观测（`actual_max_error = 0.5`，最早发生于 09:00）。`max_error` 为负数、NaN、±Inf、缺失或非数值返回 **422**；当前观测不足两条返回 **409**。
+
 ### 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
 | 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0`；排期规划 `from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
-| 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；影响预演候选时点已占用或两侧无法形成邻点；排期规划缺少覆盖边界的现有锚点或禁排约束下无解 |
-| 422 | 读数不足 3 次、全部读数被判异常、参数非法；回执校验请求结构缺失或字段类型错误（含 version=2 缺 `key_id`） |
+| 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；影响预演候选时点已占用或两侧无法形成邻点；排期规划缺少覆盖边界的现有锚点或禁排约束下无解；曲线精简时当前观测不足两条 |
+| 422 | 读数不足 3 次、全部读数被判异常、参数非法；回执校验请求结构缺失或字段类型错误（含 version=2 缺 `key_id`）；曲线精简 `max_error` 非有限非负（负数、NaN、±Inf、缺字段、非数值） |
 
 ## 本地开发
 
@@ -516,7 +557,8 @@ uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 ```
 app/
   main.py         # FastAPI 路由
-  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演、校准排期规划
+  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演、校准排期规划、校准曲线精简
+  simplification.py # 校准曲线精简纯算法：斜率区间可行性、最少保留点 DP、字典序最早重建、逐折点误差核对
   receipts.py     # 校正回执：复用漂移补偿、版本化 HMAC-SHA256 签名与常量时间校验（兼容 v1）
   receipt_keys.py # 回执密钥轮换：键环解析、key_id 校验、活跃键选择、启动时校验
   calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解、稳定窗口求解、插入影响解析比较、排期规划（禁排合并与最少时点求解）
@@ -527,5 +569,7 @@ tests/test_correction_receipts.py # 校正回执签发/校验/密钥轮换/v1 �
 tests/test_receipt_keys.py        # 键环加载与启动校验测试
 tests/test_schedule_plan.py       # 排期规划纯算法单测（禁排合并、最少时点、字典序最早、无解判定）
 tests/test_schedule_plan_api.py   # 排期规划 API 端到端测试（锚点选择、禁排边界、409/400、只读）
+tests/test_simplification.py      # 曲线精简纯算法单测（最少保留点、字典序并列、逐折点核对、穷举交叉验证）
+tests/test_simplify_api.py        # 曲线精简 API 端到端测试（精简结果、422/409、只读）
 Dockerfile / docker-compose.yml
 ```
